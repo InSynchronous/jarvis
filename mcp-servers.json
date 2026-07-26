@@ -8,8 +8,8 @@
       }
     },
     "exa": {
-      "type": "stdio",
-      "command": "python3 mcp/exa.py"
+      "type": "http",
+      "url": "https://mcp.exa.ai/mcp"
     }
   }
 }

@@ -119,6 +119,7 @@ Ollama::Ollama(std::string url, std::string model, std::string api_key, std::str
 struct StreamState {
 	std::string buffer;
 	std::string full_content;
+	std::string reasoning_content;
 	json tool_calls = json::array();
 	bool has_tool_calls = false;
 	bool openai_compat = false;
@@ -170,13 +171,21 @@ static void parseOpenAISSE(const std::string& line, StreamState* state)
 		if (delta.contains("delta")) {
 			auto& d = delta["delta"];
 
-			for (auto& field : {"content", "reasoning", "reasoning_content"}) {
-				if (d.contains(field) && !d[field].is_null()) {
-					std::string token = d[field].get<std::string>();
-					if (!token.empty()) {
-						state->full_content += token;
-						if (state->on_token) state->on_token(token);
-					}
+			// reasoning/reasoning_content goes into reasoning_content for API context but NOT on_token (display)
+			if (d.contains("reasoning_content") && !d["reasoning_content"].is_null()) {
+				std::string token = d["reasoning_content"].get<std::string>();
+				if (!token.empty()) state->reasoning_content += token;
+			}
+			if (d.contains("reasoning") && !d["reasoning"].is_null()) {
+				std::string token = d["reasoning"].get<std::string>();
+				if (!token.empty()) state->reasoning_content += token;
+			}
+			// content goes into full_content AND on_token (displayed to user)
+			if (d.contains("content") && !d["content"].is_null()) {
+				std::string token = d["content"].get<std::string>();
+				if (!token.empty()) {
+					state->full_content += token;
+					if (state->on_token) state->on_token(token);
 				}
 			}
 
@@ -259,6 +268,10 @@ static json buildResponse(StreamState& state)
 		response_msg["content"] = nullptr;
 	else
 		response_msg["content"] = state.full_content;
+
+	// Send reasoning back in reasoning_content for API context (DeepSeek thinking mode)
+	if (!state.reasoning_content.empty())
+		response_msg["reasoning_content"] = state.reasoning_content;
 
 	if (state.has_tool_calls) {
 		json formatted_calls = json::array();
@@ -407,6 +420,16 @@ void Ollama::addMessage(json message)
 json Ollama::complete(StreamCallback on_token)
 {
 	return doRequest(on_token);
+}
+
+json Ollama::getMessages()
+{
+	return messages;
+}
+
+void Ollama::setMessages(json msgs)
+{
+	messages = msgs;
 }
 
 void Ollama::addTool(json mcp_tool)

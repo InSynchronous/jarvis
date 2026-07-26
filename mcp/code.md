@@ -12,6 +12,12 @@ Your workspace is the project directory you are currently working in. All file p
 
 For any task, immediately start using tools to accomplish it. Do not output lengthy plans or explanations—take action.
 
+### Step 0: Research First
+
+Before coding, search for best practices and examples:
+- Use `exa__web_search_exa` to find documentation, examples, and solutions
+- Use `exa__web_fetch_exa` to read relevant pages for detailed context
+
 ### Step 1: Understand the Task
 
 Quickly assess what needs to be done:

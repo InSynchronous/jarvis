@@ -15,8 +15,8 @@ class Ollama {
 		std::string model;
 		std::string api_key;
 		bool openai_compat = false;
-		int max_tokens = 4096;
-		int max_context_tokens = 12000;
+		int max_tokens = 8192;
+		int max_context_tokens = 100000;
 		json messages;
 		CURL* curl = nullptr;
 		json tools = json::array();
@@ -37,6 +37,9 @@ class Ollama {
 
 		void addMessage(json message);
 		json complete(StreamCallback on_token = nullptr);
+
+	json getMessages();
+	void setMessages(json msgs);
 
 	void addTool(json mcp_tool);
 	bool hasTool(const std::string& name) const;

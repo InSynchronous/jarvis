@@ -17,6 +17,12 @@ CRITICAL: After receiving tool results, you MUST immediately continue calling mo
 
 ---
 
+### Research & OSINT
+
+Use exa tools for research before testing:
+- `exa__web_search_exa` — search for CVEs, exploit techniques, tool documentation
+- `exa__web_fetch_exa` — read vulnerability reports, advisories, writeups
+
 ### Reconnaissance & OSINT
 
 | Tool | Purpose | Example Usage |

@@ -21,6 +21,7 @@ add_executable(jarvis
 	src/HTTPTransport.cpp
 	src/MCPConnection.cpp
 	src/MCPManager.cpp
+	src/SessionManager.cpp
 	external/termmark/src/termmark.cpp
 	external/termmark/src/parser/MarkdownParser.cpp
 	external/termmark/src/renderer/Renderer.cpp

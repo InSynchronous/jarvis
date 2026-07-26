@@ -2,6 +2,7 @@
 #include "Microphone.h"
 #include "Whisper.h"
 #include "Ollama.h"
+#include "SessionManager.h"
 #include "termmark.h"
 #include "nlohmann/json.hpp"
 
@@ -28,9 +29,10 @@ namespace color {
 int main(int argc, char* argv[])
 {
 	std::string prog = std::filesystem::path(argv[0]).filename().string();
-	std::string model = "openai/gpt-oss-20b";
+	std::string model = "big-pickle";
 	std::string mode = "code";
 	std::string workspace = std::filesystem::current_path().string();
+	bool resumeFlag = false;
 
 	auto expandTilde = [](const std::string& path) -> std::string {
 		if (!path.empty() && path[0] == '~') {
@@ -47,7 +49,8 @@ int main(int argc, char* argv[])
 					  << "  FOLDER  Project directory to work in (default: current directory)\n"
 					  << "  MODEL   OpenRouter model ID (default: openai/gpt-oss-20b)\n\n"
 					  << "Options:\n"
-					  << "  -m, --mode <mode>   Agent mode: code, hack, plan (default: code)\n"
+					  << "  -m, --mode <mode>   Agent mode: code, hack, plan, ask (default: code)\n"
+					  << "  --resume            Resume the last session\n"
 					  << "  -h, --help          Show this help message\n"
 					  << "\nExamples:\n"
 					  << "  " << prog << "\n"
@@ -59,15 +62,17 @@ int main(int argc, char* argv[])
 		if (arg == "-m" || arg == "--mode") {
 			if (i + 1 < argc) {
 				mode = argv[++i];
-				if (mode != "code" && mode != "hack" && mode != "plan") {
-					std::cerr << "Invalid mode: " << mode << "\n"
-							  << "Valid modes: code, hack, plan\n";
+			if (mode != "code" && mode != "hack" && mode != "plan" && mode != "ask") {
+				std::cerr << "Invalid mode: " << mode << "\n"
+						  << "Valid modes: code, hack, plan, ask\n";
 					return 1;
 				}
 			} else {
 				std::cerr << "Error: --mode requires an argument\n";
 				return 1;
 			}
+	} else if (arg == "--resume") {
+		resumeFlag = true;
 	} else if (arg[0] == '/' || arg[0] == '.' || arg[0] == '~') {
 		workspace = std::filesystem::absolute(expandTilde(arg)).string();
 		} else {
@@ -76,14 +81,64 @@ int main(int argc, char* argv[])
 	}
 
 	std::string modeLabel = (mode == "code") ? "Coder" :
-							(mode == "hack") ? "Pentester" : "Planner";
+							(mode == "hack") ? "Pentester" :
+							(mode == "ask") ? "Assistant" : "Planner";
 	std::string promptPath = "mcp/" + mode + ".md";
+	bool fastMode = false;
 
 	Microphone mic;
 	Whisper whisper("models/ggml-base.en.bin");
 	//Ollama lama("https://ai.hackclub.com/proxy/v1/chat/completions", model, "", promptPath);
 	//Ollama lama("https://openrouter.ai/api/v1/chat/completions", model, "", promptPath);
 	Ollama lama("https://opencode.ai/zen/v1/chat/completions", model, "", promptPath);
+
+	SessionManager sessionMgr(workspace);
+	std::string currentSessionId;
+
+	if (resumeFlag) {
+		std::string lastId = sessionMgr.getLastSessionId();
+		if (!lastId.empty()) {
+			json savedMessages = sessionMgr.loadSession(lastId);
+			if (!savedMessages.empty()) {
+				lama.setMessages(savedMessages);
+				currentSessionId = lastId;
+				std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
+						  << "Resumed session " << color::bold << lastId << color::reset
+						  << " (" << savedMessages.size() << " messages)" << std::endl;
+			}
+		}
+		if (currentSessionId.empty()) {
+			std::cout << color::yellow << "No previous session found. Starting fresh." << color::reset << std::endl;
+			currentSessionId = sessionMgr.generateSessionId();
+		}
+	} else {
+		std::string lastId = sessionMgr.getLastSessionId();
+		if (!lastId.empty()) {
+			auto sessions = sessionMgr.listSessions();
+			for (auto& s : sessions) {
+				if (s.id == lastId) {
+					std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
+							  << "Found previous session " << color::bold << lastId << color::reset
+							  << " (" << s.message_count << " messages). Resume? [Y/n] " << std::flush;
+					std::string choice;
+					std::getline(std::cin, choice);
+					if (choice.empty() || choice == "y" || choice == "Y" || choice == "yes") {
+						json savedMessages = sessionMgr.loadSession(lastId);
+						if (!savedMessages.empty()) {
+							lama.setMessages(savedMessages);
+							currentSessionId = lastId;
+							std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
+									  << "Resumed session " << color::bold << lastId << color::reset
+									  << " (" << savedMessages.size() << " messages)" << std::endl;
+						}
+					}
+					break;
+				}
+			}
+		}
+		if (currentSessionId.empty())
+			currentSessionId = sessionMgr.generateSessionId();
+	}
 
 	MCPManager mcp;
 	if (!mcp.loadConfig("mcp-servers.json", workspace)) {
@@ -108,7 +163,7 @@ int main(int argc, char* argv[])
 
 	while (1) {
 		std::cout << color::cyan << color::bold << "[" << modeLabel << "] " << color::reset
-				  << color::dim << "Type /voice to speak, /servers to list tools, or type a prompt:" << color::reset << std::endl;
+				  << color::dim << "Type /fast for short answers, /voice to speak, /servers to list tools, or type a prompt:" << color::reset << std::endl;
 		std::cout << color::green << color::bold << "> " << color::reset << std::flush;
 
 		std::string input;
@@ -131,14 +186,70 @@ int main(int argc, char* argv[])
 			continue;
 		}
 
-		if (input == "/exit") {
+		if (input.rfind("/sessions", 0) == 0) {
+			auto sessions = sessionMgr.listSessions();
+			if (sessions.empty()) {
+				std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
+						  << "No saved sessions." << std::endl;
+			} else {
+				std::cout << color::cyan << color::bold << "[SESSIONS] " << color::reset << std::endl;
+				for (auto& s : sessions) {
+					std::string marker = (s.id == currentSessionId) ? (std::string(color::green) + " *" + color::reset) : "";
+					std::cout << "  " << color::bold << s.id << color::reset << marker
+							  << "  " << color::dim << s.message_count << " messages"
+							  << "  " << s.updated_at << color::reset << std::endl;
+				}
+			}
+			std::cout << std::endl;
+			continue;
+		}
+
+		if (input.rfind("/resume", 0) == 0) {
+			std::string targetId;
+			size_t spacePos = input.find(' ');
+			if (spacePos != std::string::npos)
+				targetId = input.substr(spacePos + 1);
+
+			if (targetId.empty()) {
+				targetId = sessionMgr.getLastSessionId();
+			}
+
+			if (targetId.empty()) {
+				std::cout << color::yellow << "No sessions to resume." << color::reset << std::endl;
+				continue;
+			}
+
+			json savedMessages = sessionMgr.loadSession(targetId);
+			if (savedMessages.empty()) {
+				std::cout << color::red << "Session not found: " << targetId << color::reset << std::endl;
+				continue;
+			}
+
+			lama.setMessages(savedMessages);
+			currentSessionId = targetId;
 			std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
-					  << "Goodbye!" << std::endl;
+					  << "Resumed session " << color::bold << targetId << color::reset
+					  << " (" << savedMessages.size() << " messages)" << std::endl;
+			continue;
+		}
+
+		if (input == "/exit") {
+			sessionMgr.saveSession(currentSessionId, lama.getMessages());
+			std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
+					  << "Session saved. Goodbye!" << std::endl;
 			break;
 		}
 
 		if (input == "/clear") {
 			std::cout << "\033[2J\033[H" << std::flush;
+			continue;
+		}
+
+		if (input == "/fast") {
+			fastMode = !fastMode;
+			std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
+					  << "Fast mode " << (fastMode ? color::green : color::red)
+					  << (fastMode ? "enabled" : "disabled") << color::reset << std::endl;
 			continue;
 		}
 
@@ -157,15 +268,16 @@ int main(int argc, char* argv[])
 			std::cout << color::green << color::bold << "[USER] " << color::reset
 					  << raw << std::endl;
 
-			std::cout << color::dim << "Mode? [code|hack|plan] (current: " << modeLabel << "): "
+			std::cout << color::dim << "Mode? [code|hack|plan|ask] (current: " << modeLabel << "): "
 					  << color::reset << std::flush;
 			std::string modeInput;
 			std::getline(std::cin, modeInput);
 
-			if (modeInput == "code" || modeInput == "hack" || modeInput == "plan") {
+			if (modeInput == "code" || modeInput == "hack" || modeInput == "plan" || modeInput == "ask") {
 				mode = modeInput;
 				modeLabel = (mode == "code") ? "Coder" :
-							(mode == "hack") ? "Pentester" : "Planner";
+							(mode == "hack") ? "Pentester" :
+							(mode == "ask") ? "Assistant" : "Planner";
 				promptPath = "mcp/" + mode + ".md";
 				lama.setMode(promptPath);
 				std::cout << color::magenta << color::bold << "[MODE] " << color::reset
@@ -215,10 +327,11 @@ int main(int argc, char* argv[])
 						: afterMode.substr(space);
 				}
 
-				if (newMode == "code" || newMode == "hack" || newMode == "plan") {
+				if (newMode == "code" || newMode == "hack" || newMode == "plan" || newMode == "ask") {
 					mode = newMode;
 					modeLabel = (mode == "code") ? "Coder" :
-								(mode == "hack") ? "Pentester" : "Planner";
+								(mode == "hack") ? "Pentester" :
+								(mode == "ask") ? "Assistant" : "Planner";
 					promptPath = "mcp/" + mode + ".md";
 					lama.setMode(promptPath);
 					std::cout << color::magenta << color::bold << "[MODE] " << color::reset
@@ -226,7 +339,7 @@ int main(int argc, char* argv[])
 							  << " mode (mcp/" << mode << ".md)" << std::endl;
 				} else {
 					std::cout << color::red << "Invalid mode: " << newMode
-							  << "\nValid modes: code, hack, plan" << color::reset << std::endl;
+							  << "\nValid modes: code, hack, plan, ask" << color::reset << std::endl;
 					std::cout << std::endl;
 					continue;
 				}
@@ -246,11 +359,16 @@ int main(int argc, char* argv[])
 			continue;
 		}
 
+		std::string finalPrompt = prompt;
+		if (fastMode) {
+			finalPrompt = "[FAST MODE: Answer in 1-3 sentences max. No preamble, no formatting, no explanation. Direct answer only.]\n\n" + prompt;
+		}
+
 		std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
 				  << color::dim << "Thinking..." << color::reset << std::endl;
 
 		std::string streamed;
-		json output = lama.chat(prompt, [&streamed](const std::string& token) {
+		json output = lama.chat(finalPrompt, [&streamed](const std::string& token) {
 			streamed += token;
 		});
 
@@ -317,7 +435,7 @@ int main(int argc, char* argv[])
 					}
 				}
 
-				const int max_tool_chars = 3000;
+				const int max_tool_chars = 15000;
 				if ((int)tool_text.size() > max_tool_chars) {
 					std::string truncated = tool_text.substr(0, max_tool_chars);
 					truncated += "\n... [truncated, total " + std::to_string(tool_text.size()) + " chars]";
@@ -363,9 +481,23 @@ int main(int argc, char* argv[])
 			&& !final_content.is_null()
 			&& final_content.is_string()
 			&& !final_content.get<std::string>().empty()) {
+			std::string text = final_content.get<std::string>();
+
+			// Strip inline <think> tags as fallback (models that put thinking in content)
+			size_t thinkEnd = text.find("</think>");
+			if (thinkEnd != std::string::npos) {
+				text = text.substr(thinkEnd + 9);
+				size_t start = text.find_first_not_of(" \t\n\r");
+				if (start != std::string::npos) {
+					text = text.substr(start);
+				}
+			}
+
 			std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset << std::endl;
-			termmark::renderMarkdown(final_content.get<std::string>());
+			termmark::renderMarkdown(text);
 		}
 		std::cout << std::endl;
+
+		sessionMgr.saveSession(currentSessionId, lama.getMessages());
 	}
 }

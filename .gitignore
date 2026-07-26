@@ -71,3 +71,4 @@ Testing/
 models/*
 
 .env
+.jarvis_sessions
