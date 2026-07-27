@@ -72,3 +72,4 @@ models/*
 
 .env
 .jarvis_sessions
+.playwright-mcp

@@ -29,7 +29,7 @@ namespace color {
 int main(int argc, char* argv[])
 {
 	std::string prog = std::filesystem::path(argv[0]).filename().string();
-	std::string model = "big-pickle";
+	std::string model = "nemotron-3-ultra-free";
 	std::string mode = "code";
 	std::string workspace = std::filesystem::current_path().string();
 	bool resumeFlag = false;
@@ -434,6 +434,9 @@ int main(int argc, char* argv[])
 								  << color::dim << tool_text << color::reset << std::endl;
 					}
 				}
+
+				std::cout << color::yellow << color::bold << "  [TOOL OUTPUT] " << color::reset
+						  << color::dim << tool_text.substr(0, 2000) << color::reset << std::endl;
 
 				const int max_tool_chars = 15000;
 				if ((int)tool_text.size() > max_tool_chars) {
