@@ -65,7 +65,7 @@ static size_t computeScreenLines(const std::string& text, int width) {
 }
 
 // Display abstraction shared by the TUI and the plain-stdout fallback.
-struct Sink {
+	struct Sink {
 	std::function<void(const std::string&)> user;
 	std::function<void(const std::string&)> info;
 	std::function<void(const std::string&)> error;
@@ -76,6 +76,7 @@ struct Sink {
 	std::function<void(const std::string&)> token;
 	std::function<void(const std::string&)> end;
 	std::function<void()> clear;
+	std::function<void(bool)> listening;
 };
 
 int main(int argc, char* argv[])
@@ -257,6 +258,7 @@ int main(int argc, char* argv[])
 		}
 	};
 	stdoutSink.clear = []() { std::cout << "\033[2J\033[H" << std::flush; };
+	stdoutSink.listening = [](bool) {};
 
 	// ---- Agent turn: chat, retry, tool loop ----
 	auto handlePrompt = [&](const std::string& finalPrompt, Sink& d) {
@@ -414,6 +416,7 @@ int main(int argc, char* argv[])
 			}
 
 			std::string prompt;
+			bool voiceShown = false;
 
 			if (input == "/servers") {
 				std::string list;
@@ -493,15 +496,31 @@ int main(int argc, char* argv[])
 
 			if (input == "/voice" || input.rfind("/voice ", 0) == 0) {
 				mic.start();
+				d.listening(true);
 				d.info("Listening... type anything and press Enter to stop.");
 				std::string stop;
 				readInput(stop);
 				mic.stop();
+				d.listening(false);
 
 				auto audio = mic.getAudio();
 				d.info("Processing...");
-				std::string raw = whisper.transcribe(audio);
+
+				std::string raw;
+				try {
+					raw = whisper.transcribe(audio);
+				} catch (const std::exception& e) {
+					d.error(std::string("Voice transcription failed: ") + e.what());
+					continue;
+				}
+
+				if (raw.empty()) {
+					d.info("Nothing heard.");
+					continue;
+				}
+
 				d.user(raw);
+				voiceShown = true;
 
 				d.info("Mode? [code|hack|plan|ask] (Enter keeps " + modeLabel + "):");
 				std::string modeInput;
@@ -588,7 +607,7 @@ int main(int argc, char* argv[])
 				continue;
 			}
 
-			d.user(prompt);
+			if (!voiceShown) d.user(prompt);
 
 			std::string finalPrompt = prompt;
 			if (fastMode) {
@@ -625,6 +644,7 @@ int main(int argc, char* argv[])
 	tuiSink.token = [&tui](const std::string& t) { tui.streamToken(t); };
 	tuiSink.end = [&tui](const std::string& m) { tui.endAssistant(m); };
 	tuiSink.clear = [&tui]() { tui.clearConversation(); };
+	tuiSink.listening = [&tui](bool on) { tui.setListening(on); };
 
 	auto tuiRead = [&tui](std::string& out) -> bool { return tui.popPrompt(out); };
 

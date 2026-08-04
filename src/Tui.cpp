@@ -632,7 +632,6 @@ struct JarvisTui::Impl {
 			std::lock_guard<std::mutex> lock(queue_mutex);
 			prompt = input_text;
 			while (!prompt.empty() && prompt.back() == '\n') prompt.pop_back();
-			if (prompt.empty()) return;
 			input_text.clear();
 			prompt_queue.push_back(prompt);
 		}

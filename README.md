@@ -40,6 +40,81 @@ EXA_KEY=your-exa-key-here
 - `api_key` - API key for the LLM endpoint (OpenRouter, OpenCode Zen, etc.)
 - `EXA_KEY` - API key for Exa search (used by the Exa MCP server)
 
+### Google Workspace (Gmail / Drive / Calendar)
+
+Gmail is served by a **local MCP server** (`mcp/gmail_server.py`) that calls the
+Gmail REST API directly with an OAuth bearer token — no Google MCP gateway, no
+Developer Preview enrollment needed. Drive and Calendar still use Google's
+`drivemcp.googleapis.com` / `calendarmcp.googleapis.com` MCP servers, which are
+Developer Preview only. All three share the same OAuth token setup below; tokens
+are stored under `mcp/tokens/` (gitignored) and refreshed by the helper script.
+
+One-time setup:
+
+1. Enable the base APIs in the Google Cloud console. Only `gmail.googleapis.com`
+   is required for the Gmail server; `drive.googleapis.com` / `calendar-json.googleapis.com`
+   are needed for Drive/Calendar:
+   ```bash
+   gcloud services enable gmail.googleapis.com drive.googleapis.com calendar-json.googleapis.com
+   ```
+2. Configure the OAuth consent screen, adding the scopes you want (see below).
+   For a **Workspace (business/school) account** the OAuth app must also be marked
+   **Trusted** in the Google Admin console (Apps → OAuth app access), otherwise
+   restricted scopes are blocked. For a personal Gmail account this step is not needed.
+3. Create an OAuth **Web application** client and register the redirect URI:
+   `http://127.0.0.1:8342/oauth/callback`
+4. Put the client ID/secret in `.env`:
+   ```ini
+   GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+   GOOGLE_CLIENT_SECRET=your-client-secret
+   ```
+5. Log in for each server you want:
+   ```bash
+   python3 mcp/google_auth.py login gmail
+   python3 mcp/google_auth.py login drive
+   python3 mcp/google_auth.py login calendar
+   ```
+
+Access tokens expire after ~1 hour. The gmail server auto-refreshes before each
+call; refresh other servers manually:
+
+```bash
+python3 mcp/google_auth.py refresh gmail
+```
+
+Other commands: `status <server>`, `logout <server>`.
+
+If a Google server has no token file, jarvis prints a hint and continues; a failed
+server does not prevent the rest from connecting.
+
+#### Gmail MCP tools
+
+The local `gmail` server exposes: `get_profile`, `search_threads`, `get_thread`,
+`get_message`, `list_labels`, and `create_draft`. The token's `gmail.readonly` +
+`gmail.compose` scopes cover these. Sending mail is **not** included; to add it,
+grant the `gmail.send` scope and re-login:
+
+```bash
+python3 mcp/google_auth.py login gmail --scopes \
+    https://www.googleapis.com/auth/gmail.readonly \
+    https://www.googleapis.com/auth/gmail.compose \
+    https://www.googleapis.com/auth/gmail.send
+```
+
+### Troubleshooting: "The caller does not have permission"
+
+This affects only the Drive/Calendar (Google MCP) servers, or a Gmail server still
+pointing at `gmailmcp.googleapis.com`. Check, in order:
+
+1. **Developer Preview Program enrollment** — https://developers.google.com/workspace/preview
+   must show your account/project as a participant.
+2. **MCP service enabled** — confirm `drivemcp.googleapis.com` / `calendarmcp.googleapis.com`
+   show up under "APIs & Services → Enabled APIs".
+3. **Admin trust gate** — for Workspace org accounts, the OAuth client must be marked
+   Trusted in the Admin console for restricted scopes (personal Gmail: not applicable).
+4. Sanity-check the token with `python3 mcp/google_auth.py status gmail` — if it is
+   valid, the problem is in steps 1–3, not the harness.
+
 Configure the LLM endpoint in `src/main.cpp` (line ~86). Default is OpenCode Zen:
 ```cpp
 Ollama lama("https://opencode.ai/zen/v1/chat/completions", model, "", promptPath);

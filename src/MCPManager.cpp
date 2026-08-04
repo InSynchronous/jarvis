@@ -67,6 +67,27 @@ bool MCPManager::loadConfig(const std::string& configPath, const std::string& wo
 					sc.headers[k] = v.get<std::string>();
 				}
 			}
+
+			if (serverJson.contains("tokenFile")) {
+				sc.tokenFile = serverJson["tokenFile"].get<std::string>();
+				std::ifstream tokenStream(sc.tokenFile);
+				if (tokenStream.is_open()) {
+					try {
+						json tokenJson = json::parse(tokenStream);
+						if (tokenJson.contains("access_token") &&
+							tokenJson["access_token"].is_string()) {
+							sc.headers["Authorization"] = "Bearer " +
+								tokenJson["access_token"].get<std::string>();
+						}
+					} catch (const json::parse_error& e) {
+						std::cerr << "[MCPManager] Failed to parse token file '"
+								  << sc.tokenFile << "': " << e.what() << "\n";
+					}
+				} else {
+					std::cerr << "[MCPManager] Token file not found: " << sc.tokenFile
+							  << " (run: python3 mcp/google_auth.py login " << name << ")\n";
+				}
+			}
 		} else {
 			std::cerr << "[MCPManager] Server '" << name << "' has unknown type: " << sc.type << "\n";
 			return false;
@@ -90,24 +111,23 @@ bool MCPManager::loadConfig(const std::string& configPath, const std::string& wo
 }
 
 bool MCPManager::connectAll() {
-	bool anyFailed = false;
-
-	for (auto& conn : connections) {
-		std::cerr << "[MCPManager] Connecting to " << conn->getName() << "... ";
-		if (conn->connect()) {
-			std::cerr << "OK\n";
-		} else {
-			std::cerr << "FAILED\n";
-			anyFailed = true;
-		}
-	}
-
 	if (connections.empty()) {
 		std::cerr << "[MCPManager] No servers configured\n";
 		return false;
 	}
 
-	return !anyFailed;
+	int connected = 0;
+	for (auto& conn : connections) {
+		std::cerr << "[MCPManager] Connecting to " << conn->getName() << "... ";
+		if (conn->connect()) {
+			std::cerr << "OK\n";
+			connected++;
+		} else {
+			std::cerr << "FAILED\n";
+		}
+	}
+
+	return connected > 0;
 }
 
 json MCPManager::listAllTools() {

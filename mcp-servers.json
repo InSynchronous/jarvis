@@ -14,6 +14,24 @@
     "playwright": {
       "type": "stdio",
       "command": "npx @playwright/mcp@latest --browser chromium"
+    },
+    "gmail": {
+      "type": "stdio",
+      "command": "python3 mcp/gmail_server.py",
+      "env": {
+        "GMAIL_TOKEN_FILE": "mcp/tokens/gmail.json"
+      },
+      "tokenFile": "mcp/tokens/gmail.json"
+    },
+    "drive": {
+      "type": "http",
+      "url": "https://drivemcp.googleapis.com/mcp/v1",
+      "tokenFile": "mcp/tokens/drive.json"
+    },
+    "calendar": {
+      "type": "http",
+      "url": "https://calendarmcp.googleapis.com/mcp/v1",
+      "tokenFile": "mcp/tokens/calendar.json"
     }
   }
 }

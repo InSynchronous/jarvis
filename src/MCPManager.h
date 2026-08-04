@@ -14,6 +14,7 @@ struct ServerConfig {
 	std::string type;
 	std::string command;
 	std::string url;
+	std::string tokenFile;
 	std::map<std::string, std::string> env;
 	std::map<std::string, std::string> headers;
 };
