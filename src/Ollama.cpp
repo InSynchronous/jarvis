@@ -124,6 +124,7 @@ struct StreamState {
 	bool has_tool_calls = false;
 	bool openai_compat = false;
 	StreamCallback on_token;
+	StreamCallback on_reasoning;
 };
 
 static void parseOllamaLine(const std::string& line, StreamState* state)
@@ -174,11 +175,17 @@ static void parseOpenAISSE(const std::string& line, StreamState* state)
 			// reasoning/reasoning_content goes into reasoning_content for API context but NOT on_token (display)
 			if (d.contains("reasoning_content") && !d["reasoning_content"].is_null()) {
 				std::string token = d["reasoning_content"].get<std::string>();
-				if (!token.empty()) state->reasoning_content += token;
+				if (!token.empty()) {
+					state->reasoning_content += token;
+					if (state->on_reasoning) state->on_reasoning(token);
+				}
 			}
 			if (d.contains("reasoning") && !d["reasoning"].is_null()) {
 				std::string token = d["reasoning"].get<std::string>();
-				if (!token.empty()) state->reasoning_content += token;
+				if (!token.empty()) {
+					state->reasoning_content += token;
+					if (state->on_reasoning) state->on_reasoning(token);
+				}
 			}
 			// content goes into full_content AND on_token (displayed to user)
 			if (d.contains("content") && !d["content"].is_null()) {
@@ -309,7 +316,7 @@ static json buildResponse(StreamState& state)
 	return parsed_response;
 }
 
-json Ollama::doRequest(StreamCallback on_token)
+json Ollama::doRequest(StreamCallback on_token, StreamCallback on_reasoning)
 {
 	trimContext();
 
@@ -354,6 +361,7 @@ json Ollama::doRequest(StreamCallback on_token)
 
 		StreamState state;
 		state.on_token = on_token;
+		state.on_reasoning = on_reasoning;
 		state.openai_compat = openai_compat;
 
 		curl_easy_setopt(this->curl, CURLOPT_WRITEFUNCTION, streamWriteCallback);
@@ -388,28 +396,27 @@ json Ollama::doRequest(StreamCallback on_token)
 			messages.push_back(parsed_response["message"]);
 		}
 
-		std::cout << "\n\033[2m" << parsed_response.dump(2) << "\033[0m" << std::endl;
 		return parsed_response;
 	}
 
 	return json();
 }
 
-json Ollama::chat(std::string prompt, StreamCallback on_token)
+json Ollama::chat(std::string prompt, StreamCallback on_token, StreamCallback on_reasoning)
 {
 	messages.push_back({
 		{"role", "user"},
 		{"content", prompt}
 	});
 
-	return doRequest(on_token);
+	return doRequest(on_token, on_reasoning);
 }
 
-json Ollama::chat(json message, StreamCallback on_token)
+json Ollama::chat(json message, StreamCallback on_token, StreamCallback on_reasoning)
 {
 	messages.push_back(message);
 
-	return doRequest(on_token);
+	return doRequest(on_token, on_reasoning);
 }
 
 void Ollama::addMessage(json message)
@@ -417,9 +424,9 @@ void Ollama::addMessage(json message)
 	messages.push_back(message);
 }
 
-json Ollama::complete(StreamCallback on_token)
+json Ollama::complete(StreamCallback on_token, StreamCallback on_reasoning)
 {
-	return doRequest(on_token);
+	return doRequest(on_token, on_reasoning);
 }
 
 json Ollama::getMessages()

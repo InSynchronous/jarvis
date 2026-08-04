@@ -26,17 +26,17 @@ class Ollama {
 		bool summarizing = false;
 		bool enable_summarization = true;
 
-		json doRequest(StreamCallback on_token);
+		json doRequest(StreamCallback on_token, StreamCallback on_reasoning = nullptr);
 		void trimContext();
 		void summarizeContext(int from_index, int to_index);
 
 	public:
 		Ollama(std::string url, std::string model, std::string api_key = "", std::string system_prompt_path = "");
-		json chat(std::string prompt, StreamCallback on_token = nullptr);
-		json chat(json message, StreamCallback on_token = nullptr);
+		json chat(std::string prompt, StreamCallback on_token = nullptr, StreamCallback on_reasoning = nullptr);
+		json chat(json message, StreamCallback on_token = nullptr, StreamCallback on_reasoning = nullptr);
 
 		void addMessage(json message);
-		json complete(StreamCallback on_token = nullptr);
+		json complete(StreamCallback on_token = nullptr, StreamCallback on_reasoning = nullptr);
 
 	json getMessages();
 	void setMessages(json msgs);

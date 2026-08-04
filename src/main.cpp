@@ -3,6 +3,7 @@
 #include "Whisper.h"
 #include "Ollama.h"
 #include "SessionManager.h"
+#include "Tui.h"
 #include "termmark.h"
 #include "nlohmann/json.hpp"
 
@@ -10,9 +11,12 @@
 #include <cstdlib>
 #include <ostream>
 #include <string>
+#include <functional>
 #include <filesystem>
 #include <thread>
 #include <chrono>
+#include <unistd.h>
+#include <sys/ioctl.h>
 
 namespace color {
 	const char* reset   = "\033[0m";
@@ -26,10 +30,58 @@ namespace color {
 	const char* blue    = "\033[34m";
 }
 
+static int terminalWidth() {
+	struct winsize w;
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_col > 0)
+		return w.ws_col;
+	return 80;
+}
+
+static int terminalRows() {
+	struct winsize w;
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_row > 0)
+		return w.ws_row;
+	return 24;
+}
+
+static size_t computeScreenLines(const std::string& text, int width) {
+	if (text.empty()) return 0;
+	size_t lines = 0;
+	int col = 0;
+	for (char c : text) {
+		if (c == '\n') {
+			lines++;
+			col = 0;
+		} else {
+			col++;
+			if (col >= width) {
+				lines++;
+				col = 0;
+			}
+		}
+	}
+	if (col > 0) lines++;
+	return lines;
+}
+
+// Display abstraction shared by the TUI and the plain-stdout fallback.
+struct Sink {
+	std::function<void(const std::string&)> user;
+	std::function<void(const std::string&)> info;
+	std::function<void(const std::string&)> error;
+	std::function<void(const std::string&)> tool;
+	std::function<void(const std::string&)> toolout;
+	std::function<void()> begin;
+	std::function<void(const std::string&)> reasoning;
+	std::function<void(const std::string&)> token;
+	std::function<void(const std::string&)> end;
+	std::function<void()> clear;
+};
+
 int main(int argc, char* argv[])
 {
 	std::string prog = std::filesystem::path(argv[0]).filename().string();
-	std::string model = "nemotron-3-ultra-free";
+	std::string model = "deepseek-v4-flash-free";
 	std::string mode = "code";
 	std::string workspace = std::filesystem::current_path().string();
 	bool resumeFlag = false;
@@ -93,7 +145,9 @@ int main(int argc, char* argv[])
 	Ollama lama("https://opencode.ai/zen/v1/chat/completions", model, "", promptPath);
 
 	SessionManager sessionMgr(workspace);
-	std::string currentSessionId;
+	std::string currentSessionId = sessionMgr.generateSessionId();
+	std::string resumeSessionId;
+	bool loadedResume = false;
 
 	if (resumeFlag) {
 		std::string lastId = sessionMgr.getLastSessionId();
@@ -102,42 +156,11 @@ int main(int argc, char* argv[])
 			if (!savedMessages.empty()) {
 				lama.setMessages(savedMessages);
 				currentSessionId = lastId;
-				std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
-						  << "Resumed session " << color::bold << lastId << color::reset
-						  << " (" << savedMessages.size() << " messages)" << std::endl;
+				loadedResume = true;
 			}
-		}
-		if (currentSessionId.empty()) {
-			std::cout << color::yellow << "No previous session found. Starting fresh." << color::reset << std::endl;
-			currentSessionId = sessionMgr.generateSessionId();
 		}
 	} else {
-		std::string lastId = sessionMgr.getLastSessionId();
-		if (!lastId.empty()) {
-			auto sessions = sessionMgr.listSessions();
-			for (auto& s : sessions) {
-				if (s.id == lastId) {
-					std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
-							  << "Found previous session " << color::bold << lastId << color::reset
-							  << " (" << s.message_count << " messages). Resume? [Y/n] " << std::flush;
-					std::string choice;
-					std::getline(std::cin, choice);
-					if (choice.empty() || choice == "y" || choice == "Y" || choice == "yes") {
-						json savedMessages = sessionMgr.loadSession(lastId);
-						if (!savedMessages.empty()) {
-							lama.setMessages(savedMessages);
-							currentSessionId = lastId;
-							std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
-									  << "Resumed session " << color::bold << lastId << color::reset
-									  << " (" << savedMessages.size() << " messages)" << std::endl;
-						}
-					}
-					break;
-				}
-			}
-		}
-		if (currentSessionId.empty())
-			currentSessionId = sessionMgr.generateSessionId();
+		resumeSessionId = sessionMgr.getLastSessionId();
 	}
 
 	MCPManager mcp;
@@ -154,238 +177,125 @@ int main(int argc, char* argv[])
 		lama.addTool(tool);
 	}
 
-	std::cout << "Model: " << model << " | Mode: " << color::magenta << modeLabel << color::reset
-			  << " | Workspace: " << color::dim << workspace << color::reset << std::endl;
-	std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
-			  << "Connected to " << color::bold << mcp.serverNames().size() << color::reset
-			  << " MCP server(s), " << color::bold << mcp.toolNames().size() << color::reset
-			  << " tool(s) loaded." << "\n";
+	const std::string serverInfo = std::to_string(mcp.serverNames().size()) + " server(s), " +
+								   std::to_string(mcp.toolNames().size()) + " tool(s)";
 
-	while (1) {
-		std::cout << color::cyan << color::bold << "[" << modeLabel << "] " << color::reset
-				  << color::dim << "Type /fast for short answers, /voice to speak, /servers to list tools, or type a prompt:" << color::reset << std::endl;
+	bool isTty = isatty(STDOUT_FILENO);
+
+	// ---- Read input for the plain-stdout fallback ----
+	auto stdoutRead = [&](std::string& out) -> bool {
 		std::cout << color::green << color::bold << "> " << color::reset << std::flush;
+		std::string line;
+		if (!std::getline(std::cin, line)) return false;
+		out = line;
+		return true;
+	};
 
-		std::string input;
-		std::getline(std::cin, input);
-		if (input.empty()) continue;
-
-		std::string prompt;
-
-		if (input == "/servers") {
-			std::cout << color::cyan << color::bold << "[SERVERS] " << color::reset << std::endl;
-			for (auto& name : mcp.serverNames()) {
-				std::cout << "  " << color::green << name << color::reset << std::endl;
-			}
-			std::cout << color::cyan << color::bold << "[TOOLS] " << color::reset
-					  << "(" << mcp.toolNames().size() << " total)" << std::endl;
-			for (auto& tool : mcp.toolNames()) {
-				std::cout << "  " << color::dim << tool << color::reset << std::endl;
-			}
-			std::cout << std::endl;
-			continue;
-		}
-
-		if (input.rfind("/sessions", 0) == 0) {
-			auto sessions = sessionMgr.listSessions();
-			if (sessions.empty()) {
-				std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
-						  << "No saved sessions." << std::endl;
-			} else {
-				std::cout << color::cyan << color::bold << "[SESSIONS] " << color::reset << std::endl;
-				for (auto& s : sessions) {
-					std::string marker = (s.id == currentSessionId) ? (std::string(color::green) + " *" + color::reset) : "";
-					std::cout << "  " << color::bold << s.id << color::reset << marker
-							  << "  " << color::dim << s.message_count << " messages"
-							  << "  " << s.updated_at << color::reset << std::endl;
-				}
-			}
-			std::cout << std::endl;
-			continue;
-		}
-
-		if (input.rfind("/resume", 0) == 0) {
-			std::string targetId;
-			size_t spacePos = input.find(' ');
-			if (spacePos != std::string::npos)
-				targetId = input.substr(spacePos + 1);
-
-			if (targetId.empty()) {
-				targetId = sessionMgr.getLastSessionId();
-			}
-
-			if (targetId.empty()) {
-				std::cout << color::yellow << "No sessions to resume." << color::reset << std::endl;
-				continue;
-			}
-
-			json savedMessages = sessionMgr.loadSession(targetId);
-			if (savedMessages.empty()) {
-				std::cout << color::red << "Session not found: " << targetId << color::reset << std::endl;
-				continue;
-			}
-
-			lama.setMessages(savedMessages);
-			currentSessionId = targetId;
-			std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
-					  << "Resumed session " << color::bold << targetId << color::reset
-					  << " (" << savedMessages.size() << " messages)" << std::endl;
-			continue;
-		}
-
-		if (input == "/exit") {
-			sessionMgr.saveSession(currentSessionId, lama.getMessages());
-			std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
-					  << "Session saved. Goodbye!" << std::endl;
-			break;
-		}
-
-		if (input == "/clear") {
-			std::cout << "\033[2J\033[H" << std::flush;
-			continue;
-		}
-
-		if (input == "/fast") {
-			fastMode = !fastMode;
-			std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
-					  << "Fast mode " << (fastMode ? color::green : color::red)
-					  << (fastMode ? "enabled" : "disabled") << color::reset << std::endl;
-			continue;
-		}
-
-		if (input == "/voice" || input.rfind("/voice ", 0) == 0) {
-			mic.start();
-			std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
-					  << "Speak now... Press any key to stop";
-			std::cin.get();
-			mic.stop();
-
-			auto audio = mic.getAudio();
-			std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
-					  << color::dim << "Processing..." << color::reset << std::endl;
-			std::string raw = whisper.transcribe(audio);
-
-			std::cout << color::green << color::bold << "[USER] " << color::reset
-					  << raw << std::endl;
-
-			std::cout << color::dim << "Mode? [code|hack|plan|ask] (current: " << modeLabel << "): "
-					  << color::reset << std::flush;
-			std::string modeInput;
-			std::getline(std::cin, modeInput);
-
-			if (modeInput == "code" || modeInput == "hack" || modeInput == "plan" || modeInput == "ask") {
-				mode = modeInput;
-				modeLabel = (mode == "code") ? "Coder" :
-							(mode == "hack") ? "Pentester" :
-							(mode == "ask") ? "Assistant" : "Planner";
-				promptPath = "mcp/" + mode + ".md";
-				lama.setMode(promptPath);
-				std::cout << color::magenta << color::bold << "[MODE] " << color::reset
-						  << "Switched to " << color::magenta << modeLabel << color::reset << std::endl;
-			}
-
-			prompt = raw;
-		} else {
-			// check for /model in text input
-			size_t modelPos = input.find("/model");
-			if (modelPos != std::string::npos) {
-				std::string afterModel = input.substr(modelPos + 6);
-				std::string newModel;
-				auto space = afterModel.find_first_not_of(' ');
-				if (space != std::string::npos) {
-					auto end = afterModel.find_first_of(" \n", space);
-					newModel = (end != std::string::npos)
-						? afterModel.substr(space, end - space)
-						: afterModel.substr(space);
-				}
-
-				if (!newModel.empty()) {
-					model = newModel;
-					lama.setModel(model);
-					std::cout << color::magenta << color::bold << "[MODEL] " << color::reset
-							  << "Switched to " << color::magenta << model << color::reset << std::endl;
-				} else {
-					std::cout << color::yellow << "Current model: " << model << color::reset << std::endl;
-				}
-
-				input.erase(modelPos, 6 + afterModel.size());
-				auto start = input.find_first_not_of(" \t\n");
-				auto end = input.find_last_not_of(" \t\n");
-				input = (start != std::string::npos) ? input.substr(start, end - start + 1) : "";
-			}
-
-			// check for /mode in text input
-			size_t modePos = input.find("/mode");
-			if (modePos != std::string::npos) {
-				std::string afterMode = input.substr(modePos + 5);
-				std::string newMode;
-				auto space = afterMode.find_first_not_of(' ');
-				if (space != std::string::npos) {
-					auto end = afterMode.find_first_of(" \n", space);
-					newMode = (end != std::string::npos)
-						? afterMode.substr(space, end - space)
-						: afterMode.substr(space);
-				}
-
-				if (newMode == "code" || newMode == "hack" || newMode == "plan" || newMode == "ask") {
-					mode = newMode;
-					modeLabel = (mode == "code") ? "Coder" :
-								(mode == "hack") ? "Pentester" :
-								(mode == "ask") ? "Assistant" : "Planner";
-					promptPath = "mcp/" + mode + ".md";
-					lama.setMode(promptPath);
-					std::cout << color::magenta << color::bold << "[MODE] " << color::reset
-							  << "Switched to " << color::magenta << modeLabel << color::reset
-							  << " mode (mcp/" << mode << ".md)" << std::endl;
-				} else {
-					std::cout << color::red << "Invalid mode: " << newMode
-							  << "\nValid modes: code, hack, plan, ask" << color::reset << std::endl;
-					std::cout << std::endl;
-					continue;
-				}
-
-				prompt = input;
-				prompt.erase(modePos, 5 + afterMode.size());
-				auto start = prompt.find_first_not_of(" \t\n");
-				auto end = prompt.find_last_not_of(" \t\n");
-				prompt = (start != std::string::npos) ? prompt.substr(start, end - start + 1) : "";
-			} else {
-				prompt = input;
-			}
-		}
-
-		if (prompt.empty()) {
-			std::cout << std::endl;
-			continue;
-		}
-
-		std::string finalPrompt = prompt;
-		if (fastMode) {
-			finalPrompt = "[FAST MODE: Answer in 1-3 sentences max. No preamble, no formatting, no explanation. Direct answer only.]\n\n" + prompt;
-		}
-
+	// ---- Display sinks ----
+	bool stdoutReasoningActive = false;
+	char stdoutLastChar = '\n';
+	Sink stdoutSink;
+	stdoutSink.user = [](const std::string& m) {
+		std::cout << color::green << color::bold << "[USER] " << color::reset
+				  << m << std::endl;
+	};
+	stdoutSink.info = [](const std::string& m) {
 		std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset
-				  << color::dim << "Thinking..." << color::reset << std::endl;
+				  << m << std::endl;
+	};
+	stdoutSink.error = [](const std::string& m) {
+		std::cout << color::red << color::bold << "[ERROR] " << color::reset
+				  << m << std::endl;
+	};
+	stdoutSink.tool = [](const std::string& m) {
+		std::cout << color::yellow << color::bold << "[TOOL] " << color::reset
+				  << color::dim << m << color::reset << std::endl;
+	};
+	stdoutSink.toolout = [](const std::string& m) {
+		std::cout << color::yellow << color::bold << "[TOOL OUTPUT] " << color::reset
+				  << color::dim << m << color::reset << std::endl;
+	};
+	stdoutSink.begin = [&stdoutReasoningActive]() { stdoutReasoningActive = false; };
+	stdoutSink.reasoning = [&stdoutReasoningActive, &stdoutLastChar](const std::string& token) {
+		if (!stdoutReasoningActive) {
+			std::cout << color::dim;
+			stdoutReasoningActive = true;
+		}
+		std::cout << token << std::flush;
+		stdoutLastChar = token.back();
+	};
+	stdoutSink.token = [&stdoutReasoningActive, &stdoutLastChar](const std::string& token) {
+		if (stdoutReasoningActive) {
+			std::cout << color::reset << "\n";
+			stdoutReasoningActive = false;
+		}
+		std::cout << token << std::flush;
+		stdoutLastChar = token.back();
+	};
+	stdoutSink.end = [&stdoutReasoningActive, &stdoutLastChar](const std::string& text) {
+		if (stdoutReasoningActive) {
+			std::cout << color::reset;
+			stdoutReasoningActive = false;
+		}
+		if (text.empty()) {
+			if (stdoutLastChar != '\n') std::cout << std::endl;
+			return;
+		}
+		size_t lines = computeScreenLines(text, terminalWidth());
+		if (lines > 0 && (int)lines < terminalRows()) {
+			if (text.back() == '\n') {
+				std::cout << "\033[" << lines << "A";
+			} else {
+				std::cout << "\033[" << (lines - 1) << "A\r";
+			}
+			std::cout << "\033[J";
+			termmark::renderMarkdown(text);
+		} else {
+			std::cout << "\n" << color::dim << "────────────────────────────"
+					  << color::reset << "\n";
+			termmark::renderMarkdown(text);
+		}
+	};
+	stdoutSink.clear = []() { std::cout << "\033[2J\033[H" << std::flush; };
 
-		std::string streamed;
-		json output = lama.chat(finalPrompt, [&streamed](const std::string& token) {
-			streamed += token;
-		});
+	// ---- Agent turn: chat, retry, tool loop ----
+	auto handlePrompt = [&](const std::string& finalPrompt, Sink& d) {
+		d.info("Thinking...");
+		d.begin();
+
+		auto streamReasoning = [&](const std::string& token) {
+			if (!token.empty()) d.reasoning(token);
+		};
+		auto streamToken = [&](const std::string& token) {
+			if (!token.empty()) d.token(token);
+		};
+
+		auto extractContent = [](const json& output) -> std::string {
+			const auto& msg = output["message"];
+			if (msg.contains("content") && !msg["content"].is_null() &&
+				msg["content"].is_string()) {
+				return msg["content"].get<std::string>();
+			}
+			return "";
+		};
+		auto isEmptyResponse = [](const json& output) -> bool {
+			const auto& msg = output["message"];
+			bool contentEmpty = !msg.contains("content")
+								|| msg["content"].is_null()
+								|| (msg["content"].is_string() && msg["content"].get<std::string>().empty());
+			return contentEmpty && !msg.contains("tool_calls");
+		};
+
+		json output = lama.chat(finalPrompt, streamToken, streamReasoning);
+		d.end(extractContent(output));
 
 		for (int retry = 0; retry < 3; retry++) {
-			auto& content = output["message"]["content"];
-			bool contentEmpty = !output["message"].contains("content")
-								|| content.is_null()
-								|| (content.is_string() && content.get<std::string>().empty());
-			bool empty = contentEmpty && !output["message"].contains("tool_calls");
-			if (!empty) break;
-			std::cout << color::yellow << color::bold << "  [RETRY] " << color::reset
-					  << color::dim << "Empty response, waiting 1s and retrying..." << color::reset << std::endl;
+			if (!isEmptyResponse(output)) break;
+			d.info("Empty response, waiting 1s and retrying...");
 			std::this_thread::sleep_for(std::chrono::seconds(1));
-			streamed.clear();
-			output = lama.chat(std::string("continue"), [&streamed](const std::string& token) {
-				streamed += token;
-			});
+			d.begin();
+			output = lama.chat(std::string("continue"), streamToken, streamReasoning);
+			d.end(extractContent(output));
 		}
 
 		while (output["message"].contains("tool_calls")) {
@@ -401,8 +311,7 @@ int main(int argc, char* argv[])
 					arguments = json::object();
 				}
 
-				std::cout << color::yellow << color::bold << "  [TOOL] " << color::reset
-						  << color::dim << name << color::reset << std::endl;
+				d.tool(name);
 
 				std::string tool_text;
 				if (!mcp.hasTool(name)) {
@@ -413,8 +322,7 @@ int main(int argc, char* argv[])
 						valid_list += valid[i];
 					}
 					tool_text = "Error: Unknown tool '" + name + "'. Valid tools are: " + valid_list;
-					std::cout << color::red << color::bold << "  [ERROR] " << color::reset
-							  << color::dim << tool_text << color::reset << std::endl;
+					d.error(tool_text);
 				} else {
 					try {
 						json result = mcp.callTool(name, arguments);
@@ -430,13 +338,11 @@ int main(int argc, char* argv[])
 						}
 					} catch (const std::exception& e) {
 						tool_text = std::string("Error calling tool '") + name + "': " + e.what();
-						std::cout << color::red << color::bold << "  [ERROR] " << color::reset
-								  << color::dim << tool_text << color::reset << std::endl;
+						d.error(tool_text);
 					}
 				}
 
-				std::cout << color::yellow << color::bold << "  [TOOL OUTPUT] " << color::reset
-						  << color::dim << tool_text.substr(0, 2000) << color::reset << std::endl;
+				d.toolout(tool_text.substr(0, 2000));
 
 				const int max_tool_chars = 15000;
 				if ((int)tool_text.size() > max_tool_chars) {
@@ -457,50 +363,279 @@ int main(int argc, char* argv[])
 				lama.addMessage(tool_response);
 			}
 
-			streamed.clear();
-			output = lama.complete([&streamed](const std::string& token) {
-				streamed += token;
-			});
+			d.begin();
+			output = lama.complete(streamToken, streamReasoning);
+			d.end(extractContent(output));
 
 			for (int retry = 0; retry < 3; retry++) {
-				auto& content = output["message"]["content"];
-				bool contentEmpty = !output["message"].contains("content")
-									|| content.is_null()
-									|| (content.is_string() && content.get<std::string>().empty());
-				bool empty = contentEmpty && !output["message"].contains("tool_calls");
-				if (!empty) break;
-				std::cout << color::yellow << color::bold << "  [RETRY] " << color::reset
-						  << color::dim << "Empty response, waiting 1s and retrying..." << color::reset << std::endl;
+				if (!isEmptyResponse(output)) break;
+				d.info("Empty response, waiting 1s and retrying...");
 				std::this_thread::sleep_for(std::chrono::seconds(1));
-				streamed.clear();
-				output = lama.chat(std::string("continue"), [&streamed](const std::string& token) {
-					streamed += token;
-				});
+				d.begin();
+				output = lama.chat(std::string("continue"), streamToken, streamReasoning);
+				d.end(extractContent(output));
 			}
 		}
+	};
 
-		auto& final_content = output["message"]["content"];
-		if (output["message"].contains("content")
-			&& !final_content.is_null()
-			&& final_content.is_string()
-			&& !final_content.get<std::string>().empty()) {
-			std::string text = final_content.get<std::string>();
+	// ---- Shared agent loop ----
+	auto runAgentLoop = [&](const std::function<bool(std::string&)>& readInput, Sink& d) {
+		bool pendingResume = !resumeSessionId.empty() && !loadedResume;
 
-			// Strip inline <think> tags as fallback (models that put thinking in content)
-			size_t thinkEnd = text.find("</think>");
-			if (thinkEnd != std::string::npos) {
-				text = text.substr(thinkEnd + 9);
-				size_t start = text.find_first_not_of(" \t\n\r");
-				if (start != std::string::npos) {
-					text = text.substr(start);
+		if (pendingResume) {
+			d.info("Found previous session " + resumeSessionId +
+				   ". Press Enter to resume, or type a prompt to start fresh.");
+		} else if (resumeFlag && !loadedResume) {
+			d.info("No previous session found. Starting fresh.");
+		}
+
+		d.info("Model: " + model + " | Mode: " + modeLabel + " | Workspace: " + workspace);
+		d.info("Connected to " + serverInfo + ".");
+
+		std::string input;
+		while (readInput(input)) {
+			if (pendingResume) {
+				pendingResume = false;
+				if (input.empty()) {
+					json savedMessages = sessionMgr.loadSession(resumeSessionId);
+					if (!savedMessages.empty()) {
+						lama.setMessages(savedMessages);
+						currentSessionId = resumeSessionId;
+						d.info("Resumed session " + resumeSessionId + " (" +
+							   std::to_string(savedMessages.size()) + " messages).");
+					} else {
+						d.error("Session not found: " + resumeSessionId);
+					}
+					continue;
+				}
+				if (input == "n" || input == "N" || input == "no" || input == "No") {
+					continue;
 				}
 			}
 
-			std::cout << color::cyan << color::bold << "[JARVIS] " << color::reset << std::endl;
-			termmark::renderMarkdown(text);
-		}
-		std::cout << std::endl;
+			std::string prompt;
 
-		sessionMgr.saveSession(currentSessionId, lama.getMessages());
+			if (input == "/servers") {
+				std::string list;
+				for (auto& n : mcp.serverNames()) {
+					if (!list.empty()) list += ", ";
+					list += n;
+				}
+				d.info("[SERVERS] " + list);
+				list.clear();
+				for (auto& t : mcp.toolNames()) {
+					if (!list.empty()) list += ", ";
+					list += t;
+				}
+				d.info("[TOOLS] (" + std::to_string(mcp.toolNames().size()) + " total) " + list);
+				continue;
+			}
+
+			if (input.rfind("/sessions", 0) == 0) {
+				auto sessions = sessionMgr.listSessions();
+				if (sessions.empty()) {
+					d.info("No saved sessions.");
+				} else {
+					d.info("[SESSIONS]");
+					for (auto& s : sessions) {
+						std::string marker = (s.id == currentSessionId) ? " *" : "";
+						d.info("  " + s.id + marker + "  " +
+							   std::to_string(s.message_count) + " messages  " + s.updated_at);
+					}
+				}
+				continue;
+			}
+
+			if (input.rfind("/resume", 0) == 0) {
+				std::string targetId;
+				size_t spacePos = input.find(' ');
+				if (spacePos != std::string::npos)
+					targetId = input.substr(spacePos + 1);
+
+				if (targetId.empty()) {
+					targetId = sessionMgr.getLastSessionId();
+				}
+
+				if (targetId.empty()) {
+					d.info("No sessions to resume.");
+					continue;
+				}
+
+				json savedMessages = sessionMgr.loadSession(targetId);
+				if (savedMessages.empty()) {
+					d.error("Session not found: " + targetId);
+					continue;
+				}
+
+				lama.setMessages(savedMessages);
+				currentSessionId = targetId;
+				d.info("Resumed session " + targetId + " (" +
+					   std::to_string(savedMessages.size()) + " messages).");
+				continue;
+			}
+
+			if (input == "/exit") {
+				sessionMgr.saveSession(currentSessionId, lama.getMessages());
+				d.info("Session saved. Goodbye!");
+				break;
+			}
+
+			if (input == "/clear") {
+				d.clear();
+				continue;
+			}
+
+			if (input == "/fast") {
+				fastMode = !fastMode;
+				d.info("Fast mode " + std::string(fastMode ? "enabled" : "disabled") + ".");
+				continue;
+			}
+
+			if (input == "/voice" || input.rfind("/voice ", 0) == 0) {
+				mic.start();
+				d.info("Listening... type anything and press Enter to stop.");
+				std::string stop;
+				readInput(stop);
+				mic.stop();
+
+				auto audio = mic.getAudio();
+				d.info("Processing...");
+				std::string raw = whisper.transcribe(audio);
+				d.user(raw);
+
+				d.info("Mode? [code|hack|plan|ask] (Enter keeps " + modeLabel + "):");
+				std::string modeInput;
+				readInput(modeInput);
+
+				if (modeInput == "code" || modeInput == "hack" ||
+					modeInput == "plan" || modeInput == "ask") {
+					mode = modeInput;
+					modeLabel = (mode == "code") ? "Coder" :
+								(mode == "hack") ? "Pentester" :
+								(mode == "ask") ? "Assistant" : "Planner";
+					promptPath = "mcp/" + mode + ".md";
+					lama.setMode(promptPath);
+					d.info("Switched to " + modeLabel + " mode (mcp/" + mode + ".md).");
+				}
+
+				prompt = raw;
+			} else {
+				// check for /model in text input
+				size_t modelPos = input.find("/model");
+				if (modelPos != std::string::npos) {
+					std::string afterModel = input.substr(modelPos + 6);
+					std::string newModel;
+					auto space = afterModel.find_first_not_of(' ');
+					if (space != std::string::npos) {
+						auto end = afterModel.find_first_of(" \n", space);
+						newModel = (end != std::string::npos)
+							? afterModel.substr(space, end - space)
+							: afterModel.substr(space);
+					}
+
+					if (!newModel.empty()) {
+						model = newModel;
+						lama.setModel(model);
+						d.info("Switched to model " + model + ".");
+					} else {
+						d.info("Current model: " + model);
+					}
+
+					input.erase(modelPos, 6 + afterModel.size());
+					auto start = input.find_first_not_of(" \t\n");
+					auto end = input.find_last_not_of(" \t\n");
+					input = (start != std::string::npos) ? input.substr(start, end - start + 1) : "";
+				}
+
+				// check for /mode in text input
+				size_t modePos = input.find("/mode");
+				if (modePos != std::string::npos) {
+					std::string afterMode = input.substr(modePos + 5);
+					std::string newMode;
+					auto space = afterMode.find_first_not_of(' ');
+					if (space != std::string::npos) {
+						auto end = afterMode.find_first_of(" \n", space);
+						newMode = (end != std::string::npos)
+							? afterMode.substr(space, end - space)
+							: afterMode.substr(space);
+					}
+
+					if (newMode == "code" || newMode == "hack" ||
+						newMode == "plan" || newMode == "ask") {
+						mode = newMode;
+						modeLabel = (mode == "code") ? "Coder" :
+									(mode == "hack") ? "Pentester" :
+									(mode == "ask") ? "Assistant" : "Planner";
+						promptPath = "mcp/" + mode + ".md";
+						lama.setMode(promptPath);
+						d.info("Switched to " + modeLabel + " mode (mcp/" + mode + ".md).");
+					} else {
+						d.error("Invalid mode: " + newMode);
+						continue;
+					}
+
+					prompt = input;
+					prompt.erase(modePos, 5 + afterMode.size());
+					auto start = prompt.find_first_not_of(" \t\n");
+					auto end = prompt.find_last_not_of(" \t\n");
+					prompt = (start != std::string::npos) ? prompt.substr(start, end - start + 1) : "";
+				} else {
+					prompt = input;
+				}
+			}
+
+			if (prompt.empty()) {
+				continue;
+			}
+
+			d.user(prompt);
+
+			std::string finalPrompt = prompt;
+			if (fastMode) {
+				finalPrompt = "[FAST MODE: Answer in 1-3 sentences max. No preamble, no formatting, no explanation. Direct answer only.]\n\n" + prompt;
+			}
+
+			handlePrompt(finalPrompt, d);
+			sessionMgr.saveSession(currentSessionId, lama.getMessages());
+		}
+	};
+
+	if (!isTty) {
+		// Piped / non-interactive: plain stdout streaming, no TUI.
+		runAgentLoop(stdoutRead, stdoutSink);
+		return 0;
 	}
+
+	// ---- Full-screen TUI path ----
+	JarvisTui tui;
+	tui.setModel(model);
+	tui.setMode(modeLabel);
+	tui.setWorkspace(workspace);
+	tui.setServerInfo(serverInfo);
+	tui.setFastMode(fastMode);
+
+	Sink tuiSink;
+	tuiSink.user = [&tui](const std::string& m) { tui.addUserMessage(m); };
+	tuiSink.info = [&tui](const std::string& m) { tui.addInfoMessage(m); };
+	tuiSink.error = [&tui](const std::string& m) { tui.addErrorMessage(m); };
+	tuiSink.tool = [&tui](const std::string& m) { tui.addToolCall(m); };
+	tuiSink.toolout = [&tui](const std::string& m) { tui.addToolOutput(m); };
+	tuiSink.begin = [&tui]() { tui.beginAssistant(); };
+	tuiSink.reasoning = [&tui](const std::string& t) { tui.streamReasoning(t); };
+	tuiSink.token = [&tui](const std::string& t) { tui.streamToken(t); };
+	tuiSink.end = [&tui](const std::string& m) { tui.endAssistant(m); };
+	tuiSink.clear = [&tui]() { tui.clearConversation(); };
+
+	auto tuiRead = [&tui](std::string& out) -> bool { return tui.popPrompt(out); };
+
+	std::thread worker([&] {
+		runAgentLoop(tuiRead, tuiSink);
+		tui.stop();
+	});
+
+	tui.run();
+	tui.stop();
+	if (worker.joinable()) worker.join();
+
+	return 0;
 }

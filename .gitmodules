@@ -10,3 +10,6 @@
 [submodule "external/termmark"]
 	path = external/termmark
 	url = https://github.com/ishanawal/TermMark.git
+[submodule "external/FTXUI"]
+	path = external/FTXUI
+	url = https://github.com/ArthurSonzogni/FTXUI.git

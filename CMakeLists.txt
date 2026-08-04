@@ -8,12 +8,19 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 
+set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(FTXUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+
 add_subdirectory(external/whisper.cpp)
 add_subdirectory(external/json)
+add_subdirectory(external/FTXUI)
 find_package(CURL REQUIRED)
 
 add_executable(jarvis
     src/main.cpp
+	src/Tui.cpp
 	src/Whisper.cpp
 	src/Microphone.cpp
 	src/Ollama.cpp
@@ -40,3 +47,4 @@ target_include_directories(jarvis PRIVATE
 target_link_libraries(jarvis PRIVATE whisper)
 target_link_libraries(jarvis PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(jarvis PRIVATE CURL::libcurl)
+target_link_libraries(jarvis PRIVATE component)
