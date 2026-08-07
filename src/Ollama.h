@@ -25,6 +25,7 @@ class Ollama {
 		int rate_limit_delay_ms = 2000;
 		bool summarizing = false;
 		bool enable_summarization = true;
+		bool enable_prompt_caching = true;
 
 		json doRequest(StreamCallback on_token, StreamCallback on_reasoning = nullptr);
 		void trimContext();
@@ -49,4 +50,5 @@ class Ollama {
 		void setRateLimitDelay(int ms);
 		void setMaxContextTokens(int tokens);
 		void setSummarizationEnabled(bool enabled);
+		void setPromptCachingEnabled(bool enabled);
 };

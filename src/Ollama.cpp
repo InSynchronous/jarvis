@@ -121,6 +121,7 @@ struct StreamState {
 	std::string full_content;
 	std::string reasoning_content;
 	json tool_calls = json::array();
+	json usage;
 	bool has_tool_calls = false;
 	bool openai_compat = false;
 	StreamCallback on_token;
@@ -165,6 +166,10 @@ static void parseOpenAISSE(const std::string& line, StreamState* state)
 			std::cerr << "\n[API ERROR] " << chunk["error"].dump(2) << std::endl;
 			return;
 		}
+		// The final chunk of a stream with stream_options.include_usage carries
+		// usage statistics (prompt tokens, cached tokens, etc).
+		if (chunk.contains("usage") && !chunk["usage"].is_null())
+			state->usage = chunk["usage"];
 		if (!chunk.contains("choices") || chunk["choices"].empty()) return;
 
 		auto& delta = chunk["choices"][0];
@@ -313,7 +318,29 @@ static json buildResponse(StreamState& state)
 
 	json parsed_response;
 	parsed_response["message"] = response_msg;
+	if (!state.usage.empty())
+		parsed_response["usage"] = state.usage;
 	return parsed_response;
+}
+
+// Wrap the system message's content in a text block carrying cache_control so
+// the stable prefix is marked as a cache breakpoint. The remaining messages
+// stay plain strings so their byte-identical prefix is still eligible for
+// automatic prefix caching on the next turn.
+static json buildRequestMessages(const json& messages, bool enable_caching)
+{
+	if (!enable_caching || messages.empty()) return messages;
+
+	json out = messages;
+	if (out[0].contains("content") && out[0]["content"].is_string()) {
+		json block = {
+			{"type", "text"},
+			{"text", out[0]["content"].get<std::string>()},
+			{"cache_control", {{"type", "ephemeral"}}}
+		};
+		out[0]["content"] = json::array({block});
+	}
+	return out;
 }
 
 json Ollama::doRequest(StreamCallback on_token, StreamCallback on_reasoning)
@@ -342,8 +369,11 @@ json Ollama::doRequest(StreamCallback on_token, StreamCallback on_reasoning)
 		request["model"] = model;
 		request["max_tokens"] = max_tokens;
 		request["stream"] = true;
-		request["messages"] = messages;
+		request["messages"] =
+			buildRequestMessages(messages, enable_prompt_caching && openai_compat);
 		if (!tools.empty()) request["tools"] = tools;
+		if (openai_compat)
+			request["stream_options"] = {{"include_usage", true}};
 
 		std::string j = request.dump();
 
@@ -505,6 +535,11 @@ void Ollama::setMaxContextTokens(int tokens)
 void Ollama::setSummarizationEnabled(bool enabled)
 {
 	this->enable_summarization = enabled;
+}
+
+void Ollama::setPromptCachingEnabled(bool enabled)
+{
+	this->enable_prompt_caching = enabled;
 }
 
 static int estimateTokens(const json& msg)

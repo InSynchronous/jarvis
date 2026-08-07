@@ -86,6 +86,7 @@ int main(int argc, char* argv[])
 	std::string mode = "code";
 	std::string workspace = std::filesystem::current_path().string();
 	bool resumeFlag = false;
+	bool cacheEnabled = true;
 
 	auto expandTilde = [](const std::string& path) -> std::string {
 		if (!path.empty() && path[0] == '~') {
@@ -104,6 +105,7 @@ int main(int argc, char* argv[])
 					  << "Options:\n"
 					  << "  -m, --mode <mode>   Agent mode: code, hack, plan, ask (default: code)\n"
 					  << "  --resume            Resume the last session\n"
+					  << "  --no-cache          Disable prompt caching (cache_control breakpoints)\n"
 					  << "  -h, --help          Show this help message\n"
 					  << "\nExamples:\n"
 					  << "  " << prog << "\n"
@@ -126,6 +128,8 @@ int main(int argc, char* argv[])
 			}
 	} else if (arg == "--resume") {
 		resumeFlag = true;
+	} else if (arg == "--no-cache") {
+		cacheEnabled = false;
 	} else if (arg[0] == '/' || arg[0] == '.' || arg[0] == '~') {
 		workspace = std::filesystem::absolute(expandTilde(arg)).string();
 		} else {
@@ -144,6 +148,7 @@ int main(int argc, char* argv[])
 	//Ollama lama("https://ai.hackclub.com/proxy/v1/chat/completions", model, "", promptPath);
 	//Ollama lama("https://openrouter.ai/api/v1/chat/completions", model, "", promptPath);
 	Ollama lama("https://opencode.ai/zen/v1/chat/completions", model, "", promptPath);
+	lama.setPromptCachingEnabled(cacheEnabled);
 
 	SessionManager sessionMgr(workspace);
 	std::string currentSessionId = sessionMgr.generateSessionId();
@@ -288,8 +293,27 @@ int main(int argc, char* argv[])
 			return contentEmpty && !msg.contains("tool_calls");
 		};
 
+		auto showCache = [&](const json& output) {
+			if (!output.contains("usage")) return;
+			const auto& usage = output["usage"];
+			if (!usage.contains("prompt_tokens")) return;
+			int prompt = usage["prompt_tokens"].get<int>();
+			int cached = 0;
+			if (usage.contains("prompt_tokens_details") &&
+				usage["prompt_tokens_details"].contains("cached_tokens"))
+				cached = usage["prompt_tokens_details"]["cached_tokens"].get<int>();
+			else if (usage.contains("prompt_cache_hit_tokens"))
+				cached = usage["prompt_cache_hit_tokens"].get<int>();
+			else if (usage.contains("cache_read_input_tokens"))
+				cached = usage["cache_read_input_tokens"].get<int>();
+			int pct = prompt > 0 ? (cached * 100 / prompt) : 0;
+			d.info("[CACHE] " + std::to_string(cached) + "/" + std::to_string(prompt) +
+				   " prompt tokens cached (" + std::to_string(pct) + "%)");
+		};
+
 		json output = lama.chat(finalPrompt, streamToken, streamReasoning);
 		d.end(extractContent(output));
+		showCache(output);
 
 		for (int retry = 0; retry < 3; retry++) {
 			if (!isEmptyResponse(output)) break;
@@ -368,6 +392,7 @@ int main(int argc, char* argv[])
 			d.begin();
 			output = lama.complete(streamToken, streamReasoning);
 			d.end(extractContent(output));
+			showCache(output);
 
 			for (int retry = 0; retry < 3; retry++) {
 				if (!isEmptyResponse(output)) break;

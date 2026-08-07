@@ -1,10 +1,12 @@
 #include "Tui.h"
 
+#include <algorithm>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -14,8 +16,10 @@
 #include "ftxui/component/event.hpp"
 #include "ftxui/component/screen_interactive.hpp"
 #include "ftxui/dom/elements.hpp"
+#include "ftxui/screen/screen.hpp"
 #include "ftxui/screen/string.hpp"
 #include "ftxui/screen/terminal.hpp"
+#include "ftxui/util/autoreset.hpp"
 #include "termmark.h"
 
 namespace {
@@ -370,6 +374,71 @@ std::string renderMarkdownToString(const std::string& markdown) {
 	return oss.str();
 }
 
+// ---- line-based vertical scrolling -------------------------------------
+// Like FTXUI's yframe, but the scroll offset is an exact number of lines
+// anchored to the top of the document, rather than a proportion of the whole
+// (which makes each wheel tick jump by a fixed percentage of a huge
+// conversation). The clamped offset is written back so leaving "follow the
+// latest message" mode responds on the very next wheel tick.
+
+class ScrollNode : public ftxui::Node {
+	public:
+		ScrollNode(ftxui::Elements children, int* offset)
+			: ftxui::Node(std::move(children)), offset_(offset) {}
+
+		void ComputeRequirement() override {
+			children_[0]->ComputeRequirement();
+			requirement_ = children_[0]->requirement();
+		}
+
+		void SetBox(ftxui::Box box) override {
+			box_ = box;
+			const int external_dimy = box.y_max - box.y_min;
+			const int internal_dimy =
+				std::max(requirement_.min_y, external_dimy);
+			const int max_scroll = std::max(0, internal_dimy - external_dimy - 1);
+			const int dy = std::max(0, std::min(*offset_, max_scroll));
+			last_max_scroll_ = max_scroll;
+			ftxui::Box children_box = box;
+			children_box.y_min = box.y_min - dy;
+			children_box.y_max = box.y_min + internal_dimy - dy;
+			children_[0]->SetBox(children_box);
+		}
+
+		void Render(ftxui::Screen& screen) override {
+			const ftxui::AutoReset<ftxui::Box> stencil(
+				&screen.stencil,
+				ftxui::Box::Intersection(box_, screen.stencil));
+			children_[0]->Render(screen);
+		}
+
+		// Wrapping paragraphs (FTXUI flexbox) only report an accurate min_y on
+		// their second layout pass, once asked_ has been shrunk to the real
+		// column width. The flexbox requests that extra pass itself, so on the
+		// first pass the scroll extent is computed from unwrapped heights and
+		// is too small. Clamping the offset here during that pass would pin the
+		// view one+ lines above the true bottom and "follow the latest
+		// message" mode would never reach the newest line. So the clamped
+		// offset is only written back from Check(), once no further layout
+		// passes are pending and max_scroll is final.
+		void Check(ftxui::Node::Status* status) override {
+			ftxui::Node::Check(status);
+			if (!status->need_iteration)
+				*offset_ = std::max(0, std::min(*offset_, last_max_scroll_));
+		}
+
+	private:
+		int* offset_;
+		int last_max_scroll_ = 0;
+	};
+
+ftxui::Decorator vscroll(int* offset) {
+	return [offset](ftxui::Element child) {
+		return std::make_shared<ScrollNode>(ftxui::unpack(std::move(child)),
+		                                    offset);
+	};
+}
+
 }  // namespace
 
 struct JarvisTui::Impl {
@@ -398,8 +467,10 @@ struct JarvisTui::Impl {
 	bool listening = false;
 
 	// ---- scroll state ----
-	float scroll_y = 1.f;
-	bool scrolled_by_user = false;
+	// scroll_y is the offset in lines from the top of the conversation.
+	// follow_bottom keeps the view pinned to the newest message.
+	int scroll_y = 0;
+	bool follow_bottom = true;
 
 	// ---- prompt queue ----
 	std::mutex queue_mutex;
@@ -549,16 +620,17 @@ struct JarvisTui::Impl {
 		if (event.is_mouse()) {
 			auto mouse = event.mouse();
 			std::lock_guard<std::mutex> lock(mutex);
+			constexpr int kScrollStep = 3;
 			if (mouse.button == ftxui::Mouse::WheelUp) {
-				scroll_y += 0.1f;
-				if (scroll_y > 1.f) scroll_y = 1.f;
-				scrolled_by_user = true;
+				scroll_y = std::max(0, scroll_y - kScrollStep);
+				follow_bottom = false;
 				return true;
 			}
 			if (mouse.button == ftxui::Mouse::WheelDown) {
-				scroll_y -= 0.1f;
-				if (scroll_y < 0.f) scroll_y = 0.f;
-				scrolled_by_user = true;
+				if (scroll_y <=
+					std::numeric_limits<int>::max() - kScrollStep)
+					scroll_y += kScrollStep;
+				follow_bottom = false;
 				return true;
 			}
 		}
@@ -568,11 +640,10 @@ struct JarvisTui::Impl {
 	ftxui::Component buildLayout() {
 		auto conversation = ftxui::Renderer([this] {
 			std::lock_guard<std::mutex> lock(mutex);
-			if (!messages.empty() && messages.back().streaming && !scrolled_by_user)
-				scroll_y = 1.f;
+			if (follow_bottom) scroll_y = std::numeric_limits<int>::max();
 			return conversationElementLocked() |
-			       ftxui::focusPositionRelative(0.f, scroll_y) |
-			       ftxui::vscroll_indicator | ftxui::yframe | ftxui::flex;
+			       ftxui::vscroll_indicator | vscroll(&scroll_y) |
+			       ftxui::flex;
 		});
 		auto scrollable = ftxui::CatchEvent(conversation, [this](ftxui::Event event) {
 			return handleScrollEvent(event);
@@ -638,8 +709,8 @@ struct JarvisTui::Impl {
 		queue_cv.notify_one();
 		{
 			std::lock_guard<std::mutex> lock(mutex);
-			scroll_y = 1.f;
-			scrolled_by_user = false;
+			scroll_y = 0;
+			follow_bottom = true;
 		}
 		screen.PostEvent(ftxui::Event::Custom);
 	}
@@ -702,8 +773,8 @@ void JarvisTui::addUserMessage(const std::string& text) {
 	{
 		std::lock_guard<std::mutex> lock(impl_->mutex);
 		impl_->messages.push_back(Impl::Message{"user", text, {}, "", false});
-		impl_->scroll_y = 1.f;
-		impl_->scrolled_by_user = false;
+		impl_->scroll_y = 0;
+		impl_->follow_bottom = true;
 	}
 	impl_->postRefresh();
 }
@@ -728,8 +799,8 @@ void JarvisTui::clearConversation() {
 	{
 		std::lock_guard<std::mutex> lock(impl_->mutex);
 		impl_->messages.clear();
-		impl_->scroll_y = 1.f;
-		impl_->scrolled_by_user = false;
+		impl_->scroll_y = 0;
+		impl_->follow_bottom = true;
 	}
 	impl_->postRefresh();
 }
@@ -739,8 +810,8 @@ void JarvisTui::beginAssistant() {
 		std::lock_guard<std::mutex> lock(impl_->mutex);
 		impl_->messages.push_back(
 			Impl::Message{"assistant", "", {}, "", true});
-		impl_->scroll_y = 1.f;
-		impl_->scrolled_by_user = false;
+		impl_->scroll_y = 0;
+		impl_->follow_bottom = true;
 	}
 	impl_->postRefresh();
 }
@@ -789,8 +860,8 @@ void JarvisTui::endAssistant(const std::string& markdown) {
 		} else if (m.segments.empty()) {
 			impl_->messages.pop_back();
 		}
-		impl_->scroll_y = 1.f;
-		impl_->scrolled_by_user = false;
+		impl_->scroll_y = 0;
+		impl_->follow_bottom = true;
 	}
 	impl_->postRefresh();
 }

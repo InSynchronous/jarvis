@@ -48,3 +48,6 @@ target_link_libraries(jarvis PRIVATE whisper)
 target_link_libraries(jarvis PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(jarvis PRIVATE CURL::libcurl)
 target_link_libraries(jarvis PRIVATE component)
+
+add_executable(scroll_test tests/scroll_test.cpp)
+target_link_libraries(scroll_test PRIVATE dom screen)
