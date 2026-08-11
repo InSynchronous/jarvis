@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <thread>
 #include <chrono>
+#include <atomic>
 #include <unistd.h>
 #include <sys/ioctl.h>
 
@@ -143,12 +144,19 @@ int main(int argc, char* argv[])
 	std::string promptPath = "mcp/" + mode + ".md";
 	bool fastMode = false;
 
+	// Set by the TUI when the user presses ESC; checked by the agent worker to
+	// abort the in-flight LLM request and skip remaining tool calls.
+	std::atomic<bool> interruptRequested{false};
+
 	Microphone mic;
 	Whisper whisper("models/ggml-base.en.bin");
 	//Ollama lama("https://ai.hackclub.com/proxy/v1/chat/completions", model, "", promptPath);
 	//Ollama lama("https://openrouter.ai/api/v1/chat/completions", model, "", promptPath);
 	Ollama lama("https://opencode.ai/zen/v1/chat/completions", model, "", promptPath);
 	lama.setPromptCachingEnabled(cacheEnabled);
+	lama.setInterruptCallback([&interruptRequested]() {
+		return interruptRequested.load();
+	});
 
 	SessionManager sessionMgr(workspace);
 	std::string currentSessionId = sessionMgr.generateSessionId();
@@ -267,6 +275,7 @@ int main(int argc, char* argv[])
 
 	// ---- Agent turn: chat, retry, tool loop ----
 	auto handlePrompt = [&](const std::string& finalPrompt, Sink& d) {
+		interruptRequested.store(false);
 		d.info("Thinking...");
 		d.begin();
 
@@ -278,6 +287,7 @@ int main(int argc, char* argv[])
 		};
 
 		auto extractContent = [](const json& output) -> std::string {
+			if (!output.is_object()) return "";
 			const auto& msg = output["message"];
 			if (msg.contains("content") && !msg["content"].is_null() &&
 				msg["content"].is_string()) {
@@ -286,6 +296,7 @@ int main(int argc, char* argv[])
 			return "";
 		};
 		auto isEmptyResponse = [](const json& output) -> bool {
+			if (!output.is_object()) return true;
 			const auto& msg = output["message"];
 			bool contentEmpty = !msg.contains("content")
 								|| msg["content"].is_null()
@@ -312,6 +323,11 @@ int main(int argc, char* argv[])
 		};
 
 		json output = lama.chat(finalPrompt, streamToken, streamReasoning);
+		if (interruptRequested.load()) {
+			d.end("");
+			d.info("Interrupted.");
+			return;
+		}
 		d.end(extractContent(output));
 		showCache(output);
 
@@ -321,6 +337,11 @@ int main(int argc, char* argv[])
 			std::this_thread::sleep_for(std::chrono::seconds(1));
 			d.begin();
 			output = lama.chat(std::string("continue"), streamToken, streamReasoning);
+			if (interruptRequested.load()) {
+				d.end("");
+				d.info("Interrupted.");
+				return;
+			}
 			d.end(extractContent(output));
 		}
 
@@ -328,6 +349,11 @@ int main(int argc, char* argv[])
 			json tool_calls = output["message"]["tool_calls"];
 
 			for (auto& call : tool_calls) {
+				if (interruptRequested.load()) {
+					d.info("Interrupted.");
+					return;
+				}
+
 				std::string name = call["function"]["name"];
 				std::string args_str = call["function"].value("arguments", "{}");
 				json arguments;
@@ -391,6 +417,11 @@ int main(int argc, char* argv[])
 
 			d.begin();
 			output = lama.complete(streamToken, streamReasoning);
+			if (interruptRequested.load()) {
+				d.end("");
+				d.info("Interrupted.");
+				return;
+			}
 			d.end(extractContent(output));
 			showCache(output);
 
@@ -400,9 +431,16 @@ int main(int argc, char* argv[])
 				std::this_thread::sleep_for(std::chrono::seconds(1));
 				d.begin();
 				output = lama.chat(std::string("continue"), streamToken, streamReasoning);
+				if (interruptRequested.load()) {
+					d.end("");
+					d.info("Interrupted.");
+					return;
+				}
 				d.end(extractContent(output));
 			}
 		}
+
+		std::cout << '\a' << std::flush;
 	};
 
 	// ---- Shared agent loop ----
@@ -657,6 +695,9 @@ int main(int argc, char* argv[])
 	tui.setWorkspace(workspace);
 	tui.setServerInfo(serverInfo);
 	tui.setFastMode(fastMode);
+	tui.setOnInterrupt([&interruptRequested]() {
+		interruptRequested.store(true);
+	});
 
 	Sink tuiSink;
 	tuiSink.user = [&tui](const std::string& m) { tui.addUserMessage(m); };

@@ -31,6 +31,8 @@ class Ollama {
 		void trimContext();
 		void summarizeContext(int from_index, int to_index);
 
+		std::function<bool()> interrupt_cb;
+
 	public:
 		Ollama(std::string url, std::string model, std::string api_key = "", std::string system_prompt_path = "");
 		json chat(std::string prompt, StreamCallback on_token = nullptr, StreamCallback on_reasoning = nullptr);
@@ -48,6 +50,7 @@ class Ollama {
 	void setMode(const std::string& system_prompt_path);
 		void setModel(const std::string& newModel);
 		void setRateLimitDelay(int ms);
+		void setInterruptCallback(std::function<bool()> cb);
 		void setMaxContextTokens(int tokens);
 		void setSummarizationEnabled(bool enabled);
 		void setPromptCachingEnabled(bool enabled);

@@ -126,7 +126,12 @@ struct StreamState {
 	bool openai_compat = false;
 	StreamCallback on_token;
 	StreamCallback on_reasoning;
+	std::function<bool()> interrupt_cb;
 };
+
+static bool interruptRequested(const StreamState* state) {
+	return state->interrupt_cb && state->interrupt_cb();
+}
 
 static void parseOllamaLine(const std::string& line, StreamState* state)
 {
@@ -239,6 +244,8 @@ static void parseOpenAISSE(const std::string& line, StreamState* state)
 static size_t streamWriteCallback(void* contents, size_t size, size_t nmemb, void* userp)
 {
 	StreamState* state = static_cast<StreamState*>(userp);
+	if (interruptRequested(state))
+		return 0;
 	size_t totalSize = size * nmemb;
 	state->buffer.append(static_cast<char*>(contents), totalSize);
 
@@ -258,6 +265,12 @@ static size_t streamWriteCallback(void* contents, size_t size, size_t nmemb, voi
 	}
 
 	return totalSize;
+}
+
+static int progressCallback(void* clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
+{
+	StreamState* state = static_cast<StreamState*>(clientp);
+	return interruptRequested(state) ? 1 : 0;
 }
 
 static void processRemainingBuffer(StreamState* state)
@@ -363,7 +376,7 @@ json Ollama::doRequest(StreamCallback on_token, StreamCallback on_reasoning)
 
 		this->curl = curl_easy_init();
 		if (!this->curl)
-			return json();
+			return json::object();
 
 		json request;
 		request["model"] = model;
@@ -393,9 +406,16 @@ json Ollama::doRequest(StreamCallback on_token, StreamCallback on_reasoning)
 		state.on_token = on_token;
 		state.on_reasoning = on_reasoning;
 		state.openai_compat = openai_compat;
+		state.interrupt_cb = interrupt_cb;
 
 		curl_easy_setopt(this->curl, CURLOPT_WRITEFUNCTION, streamWriteCallback);
 		curl_easy_setopt(this->curl, CURLOPT_WRITEDATA, &state);
+
+		// Poll for interruption even while waiting for the server to send data,
+		// so ESC aborts slow / stalled streams instead of only the next chunk.
+		curl_easy_setopt(this->curl, CURLOPT_NOPROGRESS, 0L);
+		curl_easy_setopt(this->curl, CURLOPT_XFERINFOFUNCTION, progressCallback);
+		curl_easy_setopt(this->curl, CURLOPT_XFERINFODATA, &state);
 
 		CURLcode result = curl_easy_perform(this->curl);
 
@@ -418,7 +438,7 @@ json Ollama::doRequest(StreamCallback on_token, StreamCallback on_reasoning)
 		}
 
 		if (result != CURLE_OK)
-			return json();
+			return json::object();
 
 		json parsed_response = buildResponse(state);
 
@@ -525,6 +545,11 @@ void Ollama::setModel(const std::string& newModel)
 void Ollama::setRateLimitDelay(int ms)
 {
 	this->rate_limit_delay_ms = ms;
+}
+
+void Ollama::setInterruptCallback(std::function<bool()> cb)
+{
+	this->interrupt_cb = std::move(cb);
 }
 
 void Ollama::setMaxContextTokens(int tokens)

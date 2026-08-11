@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -481,6 +482,7 @@ struct JarvisTui::Impl {
 	// ---- FTXUI ----
 	ftxui::ScreenInteractive screen{ftxui::ScreenInteractive::Fullscreen()};
 	std::string input_text;
+	std::function<void()> on_interrupt;
 
 	Impl() = default;
 
@@ -694,7 +696,13 @@ struct JarvisTui::Impl {
 			hint,
 		});
 		input->TakeFocus();
-		return layout;
+		return ftxui::CatchEvent(layout, [this](ftxui::Event event) {
+			if (event == ftxui::Event::Escape) {
+				if (on_interrupt) on_interrupt();
+				return true;
+			}
+			return false;
+		});
 	}
 
 	void submit() {
@@ -899,4 +907,8 @@ void JarvisTui::setListening(bool on) {
 		impl_->listening = on;
 	}
 	impl_->postRefresh();
+}
+
+void JarvisTui::setOnInterrupt(std::function<void()> cb) {
+	impl_->on_interrupt = std::move(cb);
 }

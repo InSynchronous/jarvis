@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <string>
+#include <functional>
 
 // Full-screen terminal UI for jarvis, built on FTXUI.
 //
@@ -50,6 +51,8 @@ class JarvisTui {
 		void setFastMode(bool on);
 		void setThinking(bool on);
 		void setListening(bool on);
+		// Called when the user presses ESC. Used to interrupt a running agent.
+		void setOnInterrupt(std::function<void()> cb);
 
 	private:
 		struct Impl;
