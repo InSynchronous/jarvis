@@ -61,7 +61,7 @@ static std::string loadPromptWithTools(const std::string& promptPath) {
 	return content;
 }
 
-static void loadEnvFile(const std::string& path)
+void loadEnvFile(const std::string& path)
 {
 	std::ifstream file(path);
 	if (!file.is_open()) return;

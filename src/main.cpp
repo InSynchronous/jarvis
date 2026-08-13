@@ -78,12 +78,19 @@ static size_t computeScreenLines(const std::string& text, int width) {
 	std::function<void(const std::string&)> end;
 	std::function<void()> clear;
 	std::function<void(bool)> listening;
+	// Status-bar-only updates (no-ops in the plain-stdout fallback).
+	std::function<void(const std::string&)> model;
+	std::function<void(const std::string&)> mode;
+	std::function<void(bool)> fast;
 };
 
 int main(int argc, char* argv[])
 {
+	loadEnvFile(".env");
+
 	std::string prog = std::filesystem::path(argv[0]).filename().string();
-	std::string model = "deepseek-v4-flash-free";
+	const char* env_model = std::getenv("JARVIS_MODEL");
+	std::string model = (env_model && *env_model) ? env_model : "deepseek-v4-flash-free";
 	std::string mode = "code";
 	std::string workspace = std::filesystem::current_path().string();
 	bool resumeFlag = false;
@@ -102,12 +109,16 @@ int main(int argc, char* argv[])
 		if (arg == "--help" || arg == "-h") {
 			std::cout << "Usage: " << prog << " [OPTIONS] [FOLDER] [MODEL]\n\n"
 					  << "  FOLDER  Project directory to work in (default: current directory)\n"
-					  << "  MODEL   OpenRouter model ID (default: openai/gpt-oss-20b)\n\n"
+					  << "  MODEL   Model ID (default: $JARVIS_MODEL or deepseek-v4-flash-free)\n\n"
 					  << "Options:\n"
 					  << "  -m, --mode <mode>   Agent mode: code, hack, plan, ask (default: code)\n"
 					  << "  --resume            Resume the last session\n"
 					  << "  --no-cache          Disable prompt caching (cache_control breakpoints)\n"
 					  << "  -h, --help          Show this help message\n"
+					  << "\nConfiguration (.env):\n"
+					  << "  JARVIS_ENDPOINT     LLM endpoint URL (default: OpenCode Zen)\n"
+					  << "  JARVIS_MODEL        Default model ID\n"
+					  << "  api_key             LLM API key\n"
 					  << "\nExamples:\n"
 					  << "  " << prog << "\n"
 					  << "  " << prog << " /path/to/project\n"
@@ -148,11 +159,14 @@ int main(int argc, char* argv[])
 	// abort the in-flight LLM request and skip remaining tool calls.
 	std::atomic<bool> interruptRequested{false};
 
+	const char* env_endpoint = std::getenv("JARVIS_ENDPOINT");
+	std::string endpoint = (env_endpoint && *env_endpoint)
+		? env_endpoint
+		: "https://opencode.ai/zen/v1/chat/completions";
+
 	Microphone mic;
 	Whisper whisper("models/ggml-base.en.bin");
-	//Ollama lama("https://ai.hackclub.com/proxy/v1/chat/completions", model, "", promptPath);
-	//Ollama lama("https://openrouter.ai/api/v1/chat/completions", model, "", promptPath);
-	Ollama lama("https://opencode.ai/zen/v1/chat/completions", model, "", promptPath);
+	Ollama lama(endpoint, model, "", promptPath);
 	lama.setPromptCachingEnabled(cacheEnabled);
 	lama.setInterruptCallback([&interruptRequested]() {
 		return interruptRequested.load();
@@ -272,6 +286,9 @@ int main(int argc, char* argv[])
 	};
 	stdoutSink.clear = []() { std::cout << "\033[2J\033[H" << std::flush; };
 	stdoutSink.listening = [](bool) {};
+	stdoutSink.model = [](const std::string&) {};
+	stdoutSink.mode = [](const std::string&) {};
+	stdoutSink.fast = [](bool) {};
 
 	// ---- Agent turn: chat, retry, tool loop ----
 	auto handlePrompt = [&](const std::string& finalPrompt, Sink& d) {
@@ -553,6 +570,7 @@ int main(int argc, char* argv[])
 
 			if (input == "/fast") {
 				fastMode = !fastMode;
+				d.fast(fastMode);
 				d.info("Fast mode " + std::string(fastMode ? "enabled" : "disabled") + ".");
 				continue;
 			}
@@ -597,6 +615,7 @@ int main(int argc, char* argv[])
 								(mode == "ask") ? "Assistant" : "Planner";
 					promptPath = "mcp/" + mode + ".md";
 					lama.setMode(promptPath);
+					d.mode(modeLabel);
 					d.info("Switched to " + modeLabel + " mode (mcp/" + mode + ".md).");
 				}
 
@@ -618,6 +637,7 @@ int main(int argc, char* argv[])
 					if (!newModel.empty()) {
 						model = newModel;
 						lama.setModel(model);
+						d.model(model);
 						d.info("Switched to model " + model + ".");
 					} else {
 						d.info("Current model: " + model);
@@ -650,6 +670,7 @@ int main(int argc, char* argv[])
 									(mode == "ask") ? "Assistant" : "Planner";
 						promptPath = "mcp/" + mode + ".md";
 						lama.setMode(promptPath);
+						d.mode(modeLabel);
 						d.info("Switched to " + modeLabel + " mode (mcp/" + mode + ".md).");
 					} else {
 						d.error("Invalid mode: " + newMode);
@@ -711,6 +732,9 @@ int main(int argc, char* argv[])
 	tuiSink.end = [&tui](const std::string& m) { tui.endAssistant(m); };
 	tuiSink.clear = [&tui]() { tui.clearConversation(); };
 	tuiSink.listening = [&tui](bool on) { tui.setListening(on); };
+	tuiSink.model = [&tui](const std::string& m) { tui.setModel(m); };
+	tuiSink.mode = [&tui](const std::string& m) { tui.setMode(m); };
+	tuiSink.fast = [&tui](bool on) { tui.setFastMode(on); };
 
 	auto tuiRead = [&tui](std::string& out) -> bool { return tui.popPrompt(out); };
 

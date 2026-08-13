@@ -9,6 +9,8 @@
 using json = nlohmann::json;
 using StreamCallback = std::function<void(const std::string&)>;
 
+void loadEnvFile(const std::string& path);
+
 class Ollama {
 	private:
 		std::string url;

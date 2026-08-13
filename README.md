@@ -34,10 +34,14 @@ Create `.env` in the project root:
 
 ```ini
 api_key=your-api-key-here
+JARVIS_ENDPOINT=https://opencode.ai/zen/v1/chat/completions
+JARVIS_MODEL=deepseek-v4-flash-free
 EXA_KEY=your-exa-key-here
 ```
 
 - `api_key` - API key for the LLM endpoint (OpenRouter, OpenCode Zen, etc.)
+- `JARVIS_ENDPOINT` - LLM endpoint URL (defaults to OpenCode Zen if unset)
+- `JARVIS_MODEL` - Default model ID (a model passed on the CLI overrides this)
 - `EXA_KEY` - API key for Exa search (used by the Exa MCP server)
 
 ### Google Workspace (Gmail / Drive / Calendar)
@@ -115,16 +119,9 @@ pointing at `gmailmcp.googleapis.com`. Check, in order:
 4. Sanity-check the token with `python3 mcp/google_auth.py status gmail` — if it is
    valid, the problem is in steps 1–3, not the harness.
 
-Configure the LLM endpoint in `src/main.cpp` (line ~86). Default is OpenCode Zen:
-```cpp
-Ollama lama("https://opencode.ai/zen/v1/chat/completions", model, "", promptPath);
-```
-
-Alternative endpoints (uncomment to use):
-```cpp
-// Ollama lama("https://openrouter.ai/api/v1/chat/completions", model, "", promptPath);
-// Ollama lama("https://ai.hackclub.com/proxy/v1/chat/completions", model, "", promptPath);
-```
+The LLM endpoint and default model are configured via `JARVIS_ENDPOINT` and
+`JARVIS_MODEL` in `.env` (see above). Any OpenAI-compatible endpoint works,
+e.g. OpenCode Zen, OpenRouter, or a local Ollama server.
 
 ## Running
 
